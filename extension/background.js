@@ -5,44 +5,54 @@ const playerState = {
   workflowId: null,
   tabId: null,
   steps: [],
-  status: "idle", // idle | loading | running | paused | stopped | finished | error | jumping
+  status: "idle",
   currentStepIndex: 0,
   totalSteps: 0,
   isLoopActive: false,
-  workflowMeta: null,
   runToken: 0,
   controlLock: false,
 };
-
-async function getPlayerConfig() {
-  const data = await chrome.storage.local.get(["playerConfig"]);
-  return {
-    stepDelayMs: Number.isFinite(data.playerConfig?.stepDelayMs)
-      ? data.playerConfig.stepDelayMs
-      : DEFAULT_STEP_DELAY_MS,
-  };
-}
-
-async function setPlayerConfig(config) {
-  const current = await getPlayerConfig();
-  const next = {
-    ...current,
-    ...config,
-    stepDelayMs:
-      Number.isFinite(config?.stepDelayMs) && config.stepDelayMs >= 0
-        ? config.stepDelayMs
-        : current.stepDelayMs,
-  };
-  await chrome.storage.local.set({ playerConfig: next });
-  return next;
-}
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function setRunStatus(status) {
-  return chrome.storage.local.set({ localRunStatus: status });
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!response.ok) {
+    throw new Error(typeof data === "string" ? data : data?.detail || data?.message || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+function sortSteps(steps) {
+  return (Array.isArray(steps) ? steps : []).slice().sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+}
+
+async function getPlayerConfig() {
+  const data = await chrome.storage.local.get(["playerConfig"]);
+  return {
+    stepDelayMs: Number.isFinite(data.playerConfig?.stepDelayMs) ? data.playerConfig.stepDelayMs : DEFAULT_STEP_DELAY_MS,
+  };
+}
+
+async function setPlayerConfig(config) {
+  const current = await getPlayerConfig();
+  const safeDelay = Number.isFinite(config?.stepDelayMs) && config.stepDelayMs >= 0 ? config.stepDelayMs : current.stepDelayMs;
+  const next = { ...current, ...config, stepDelayMs: safeDelay };
+  await chrome.storage.local.set({ playerConfig: next });
+  return next;
+}
+
+async function setRunStatus(status) {
+  await chrome.storage.local.set({ localRunStatus: { ...status, updatedAt: Date.now() } });
 }
 
 async function getRunStatus() {
@@ -50,52 +60,9 @@ async function getRunStatus() {
   return data.localRunStatus || null;
 }
 
-async function updateStepProgress(partial) {
+async function updateRunStatus(partial) {
   const current = (await getRunStatus()) || {};
-  await setRunStatus({ ...current, ...partial, updatedAt: Date.now() });
-}
-
-async function waitForTabComplete(tabId, timeoutMs = 30000) {
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "complete") {
-      await delay(800);
-      return tab;
-    }
-    await delay(250);
-  }
-
-  throw new Error("Timed out waiting for tab to finish loading");
-}
-
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const text = await response.text();
-  let data = null;
-
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch (_) {
-    data = text;
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      typeof data === "string"
-        ? data
-        : data?.detail || data?.message || `HTTP ${response.status}`
-    );
-  }
-
-  return data;
-}
-
-function sortSteps(steps) {
-  return (Array.isArray(steps) ? steps : [])
-    .slice()
-    .sort((a, b) => (a.order_index ?? 0) - (b.order_index ?? 0));
+  await setRunStatus({ ...current, ...partial });
 }
 
 function samePage(currentUrl, targetUrl) {
@@ -108,23 +75,65 @@ function samePage(currentUrl, targetUrl) {
   }
 }
 
-async function ensureStepPage(tabId, step) {
-  if (!step?.target_url || step.action === "navigate") return;
+async function waitForTabComplete(tabId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "complete") {
+      await delay(700);
+      return tab;
+    }
+    await delay(250);
+  }
+  throw new Error("Timed out waiting for tab to finish loading");
+}
 
-  const tab = await chrome.tabs.get(tabId);
-  const currentUrl = tab.url || "";
+function invalidateRunningLoop() {
+  playerState.runToken += 1;
+}
 
-  if (!samePage(currentUrl, step.target_url)) {
-    await chrome.tabs.update(tabId, { url: step.target_url });
-    await waitForTabComplete(tabId);
+async function waitForLoopToStop(timeoutMs = 15000) {
+  const start = Date.now();
+  while (playerState.isLoopActive) {
+    if (Date.now() - start > timeoutMs) throw new Error("Timed out waiting for current run loop to stop.");
+    await delay(50);
   }
 }
 
-async function resolveAndExecuteInPage(tabId, step) {
-  const [{ result }] = await chrome.scripting.executeScript({
+async function withControlLock(fn) {
+  if (playerState.controlLock) throw new Error("Another player action is already in progress.");
+  playerState.controlLock = true;
+  try {
+    return await fn();
+  } finally {
+    playerState.controlLock = false;
+  }
+}
+
+async function pauseLoopIfRunning(message = "Workflow paused.") {
+  if (playerState.status === "running") {
+    playerState.status = "paused";
+    invalidateRunningLoop();
+    await waitForLoopToStop();
+    await updateRunStatus({
+      phase: "paused",
+      message,
+      workflowId: playerState.workflowId,
+      currentStepIndex: playerState.currentStepIndex,
+      totalSteps: playerState.totalSteps,
+      completedSteps: playerState.currentStepIndex,
+    });
+  }
+}
+
+async function injectPageHelper(tabId) {
+  await chrome.scripting.executeScript({
     target: { tabId },
     world: "MAIN",
-    func: async (stepArg) => {
+    func: () => {
+      if (window.__observeAiHelperInjected) return;
+      window.__observeAiHelperInjected = true;
+
       function dedupe(values) {
         const out = [];
         const seen = new Set();
@@ -141,67 +150,95 @@ async function resolveAndExecuteInPage(tabId, step) {
         return (el?.innerText || el?.textContent || el?.value || "").trim();
       }
 
-      function trySelectors(stepObj) {
+      function resolveElement(stepObj) {
         const selectors = [];
+        if (stepObj.preview?.predicted_selector) selectors.push(stepObj.preview.predicted_selector);
         if (stepObj.selector) selectors.push(stepObj.selector);
         selectors.push(...(stepObj.fallback_selectors || []));
-
         for (const item of stepObj.selector_candidates || []) {
           if (typeof item === "string") selectors.push(item);
-          else if (item && item.selector) selectors.push(item.selector);
+          else if (item?.selector) selectors.push(item.selector);
         }
 
         for (const selector of dedupe(selectors)) {
           try {
             const el = document.querySelector(selector);
             if (el) return { el, usedSelector: selector };
-          } catch (_) {}
+          } catch {}
         }
 
-        return null;
-      }
-
-      function tryTextFallback(stepObj) {
         const ctx = stepObj.element_context || {};
-        const wantedText = (ctx.direct_text || ctx.text || stepObj.text || "").trim();
+        const wantedText = (ctx.direct_text || ctx.text || stepObj.text || "").trim().toLowerCase();
         const wantedTag = (ctx.tag || "").toLowerCase();
-
-        if (!wantedText) return null;
-
-        const selector = wantedTag || "a,button,input,label,span,div";
-        const candidates = Array.from(document.querySelectorAll(selector));
-        const normalizedWanted = wantedText.toLowerCase();
-
-        for (const el of candidates) {
-          const actual = textOf(el).toLowerCase();
-          if (actual && (actual.includes(normalizedWanted) || normalizedWanted.includes(actual))) {
-            return { el, usedSelector: `text:${wantedText}` };
+        if (wantedText) {
+          const selector = wantedTag || "a,button,input,label,span,div,textarea,select";
+          for (const el of Array.from(document.querySelectorAll(selector))) {
+            const actual = textOf(el).toLowerCase();
+            if (actual && (actual.includes(wantedText) || wantedText.includes(actual))) {
+              return { el, usedSelector: `text:${wantedText}` };
+            }
           }
         }
         return null;
       }
 
+      function clearHighlight() {
+        const existing = document.getElementById("observe-ai-highlight");
+        if (existing) existing.remove();
+      }
+
+      function highlightStep(stepObj) {
+        clearHighlight();
+        if (stepObj.action === "navigate") {
+          return { ok: true, usedSelector: null, message: `Navigate to ${stepObj.target_url || "page"}` };
+        }
+        const resolved = resolveElement(stepObj);
+        if (!resolved?.el) throw new Error(`Could not resolve element for ${stepObj.action}`);
+        const rect = resolved.el.getBoundingClientRect();
+        const box = document.createElement("div");
+        box.id = "observe-ai-highlight";
+        box.style.position = "fixed";
+        box.style.left = `${Math.max(rect.left - 4, 0)}px`;
+        box.style.top = `${Math.max(rect.top - 4, 0)}px`;
+        box.style.width = `${Math.max(rect.width + 8, 24)}px`;
+        box.style.height = `${Math.max(rect.height + 8, 24)}px`;
+        box.style.border = "3px solid #2563eb";
+        box.style.borderRadius = "10px";
+        box.style.background = "rgba(37, 99, 235, 0.12)";
+        box.style.boxShadow = "0 0 0 99999px rgba(15, 23, 42, 0.15)";
+        box.style.zIndex = "2147483647";
+        box.style.pointerEvents = "none";
+        const label = document.createElement("div");
+        label.textContent = `${(stepObj.action || "step").toUpperCase()} • ${stepObj.name || resolved.usedSelector || "target"} • ${stepObj.preview?.confidence ?? stepObj.confidence ?? "?"}%`;
+        label.style.position = "absolute";
+        label.style.left = "0";
+        label.style.top = "-30px";
+        label.style.padding = "6px 10px";
+        label.style.background = "#0f172a";
+        label.style.color = "white";
+        label.style.borderRadius = "999px";
+        label.style.fontSize = "12px";
+        label.style.fontWeight = "600";
+        label.style.maxWidth = "360px";
+        label.style.whiteSpace = "nowrap";
+        label.style.overflow = "hidden";
+        label.style.textOverflow = "ellipsis";
+        box.appendChild(label);
+        document.documentElement.appendChild(box);
+        resolved.el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
+        return { ok: true, usedSelector: resolved.usedSelector, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+      }
+
       function setNativeValue(el, value) {
         const tag = el.tagName?.toLowerCase();
-
         if (tag === "input") {
-          const descriptor = Object.getOwnPropertyDescriptor(
-            HTMLInputElement.prototype,
-            "value"
-          );
-          descriptor?.set?.call(el, value);
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(el, value);
           return;
         }
-
         if (tag === "textarea") {
-          const descriptor = Object.getOwnPropertyDescriptor(
-            HTMLTextAreaElement.prototype,
-            "value"
-          );
-          descriptor?.set?.call(el, value);
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(el, value);
           return;
         }
-
         el.value = value;
       }
 
@@ -211,535 +248,335 @@ async function resolveAndExecuteInPage(tabId, step) {
         el.dispatchEvent(new Event("blur", { bubbles: true }));
       }
 
-      const action = stepArg.action;
-      if (action === "navigate") {
-        return { ok: true, usedSelector: null };
-      }
-
-      const resolved = trySelectors(stepArg) || tryTextFallback(stepArg);
-      if (!resolved || !resolved.el) {
-        throw new Error(`Could not resolve element for action ${action}`);
-      }
-
-      const el = resolved.el;
-
-      if (action === "click") {
+      async function executeStep(stepObj) {
+        if (stepObj.action === "navigate") return { ok: true, usedSelector: null };
+        const resolved = resolveElement(stepObj);
+        if (!resolved?.el) throw new Error(`Could not resolve element for ${stepObj.action}`);
+        const el = resolved.el;
         el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
         el.focus?.();
-        el.click();
+        if (stepObj.action === "click") {
+          el.click();
+        } else if (stepObj.action === "input") {
+          setNativeValue(el, stepObj.value ?? "");
+          dispatchInputEvents(el);
+        } else if (stepObj.action === "select") {
+          el.value = stepObj.value ?? "";
+          dispatchInputEvents(el);
+        } else if (stepObj.action === "upload") {
+          throw new Error("Local popup execution does not support file uploads yet.");
+        } else {
+          throw new Error(`Unsupported local action: ${stepObj.action}`);
+        }
         return { ok: true, usedSelector: resolved.usedSelector };
       }
 
-      if (action === "input") {
-        el.scrollIntoView({ behavior: "instant", block: "center", inline: "center" });
-        el.focus?.();
-        setNativeValue(el, stepArg.value ?? "");
-        dispatchInputEvents(el);
-        return { ok: true, usedSelector: resolved.usedSelector };
-      }
-
-      if (action === "select") {
-        el.value = stepArg.value ?? "";
-        dispatchInputEvents(el);
-        return { ok: true, usedSelector: resolved.usedSelector };
-      }
-
-      throw new Error(`Unsupported local action: ${action}`);
+      window.__observeAiResolveStep = resolveElement;
+      window.__observeAiHighlightStep = highlightStep;
+      window.__observeAiClearHighlight = clearHighlight;
+      window.__observeAiExecuteStep = executeStep;
     },
-    args: [step],
   });
+}
 
+async function ensureStepPage(tabId, step) {
+  if (!step?.target_url || step.action === "navigate") return;
+  const tab = await chrome.tabs.get(tabId);
+  const currentUrl = tab.url || "";
+  if (!samePage(currentUrl, step.target_url)) {
+    await chrome.tabs.update(tabId, { url: step.target_url });
+    await waitForTabComplete(tabId);
+  }
+}
+
+async function runInPage(tabId, fnName, step) {
+  await injectPageHelper(tabId);
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: async (name, payload) => {
+      const fn = window[name];
+      if (typeof fn !== "function") throw new Error(`${name} is not available in page context`);
+      return await fn(payload);
+    },
+    args: [fnName, step],
+  });
   return result;
 }
 
+async function clearPageHighlight(tabId) {
+  if (!tabId) return;
+  try {
+    await injectPageHelper(tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => window.__observeAiClearHighlight?.(),
+    });
+  } catch {}
+}
+
+async function getStoredSteps() {
+  const data = await chrome.storage.local.get(["steps"]);
+  return Array.isArray(data.steps) ? data.steps : [];
+}
+
 async function uploadAndProcessWorkflow({ name, description }) {
-  const { steps = [] } = await chrome.storage.local.get(["steps"]);
-  const recordedSteps = Array.isArray(steps) ? steps : [];
-
-  if (!recordedSteps.length) {
-    throw new Error("No recorded steps found.");
-  }
-
+  const recordedSteps = await getStoredSteps();
+  if (!recordedSteps.length) throw new Error("No recorded steps found.");
+  await updateRunStatus({ phase: "uploading", message: "Workflow is uploading..." });
   const payload = {
     name: name || "My recorded workflow",
     description: description || "Recorded from Chrome extension",
     source_url: recordedSteps[0]?.url || null,
     raw_steps: recordedSteps,
   };
-
-  await updateStepProgress({ phase: "uploading", message: "Workflow is uploading..." });
-
   const data = await fetchJson(`${API_BASE}/workflows`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
-  await updateStepProgress({
+  await chrome.storage.local.set({ lastWorkflowId: data.workflow_id });
+  await updateRunStatus({
     phase: "processed",
     message: "Workflow uploaded and processed successfully.",
     workflowId: data.workflow_id,
-    processedStepCount: data.processed_step_count,
     rawStepCount: data.raw_step_count,
+    processedStepCount: data.processed_step_count,
   });
-
-  await chrome.storage.local.set({ lastWorkflowId: data.workflow_id });
   return data;
 }
 
-function invalidateRunningLoop() {
-  playerState.runToken += 1;
+function stepReviewSummary(step) {
+  const confidence = step.preview?.confidence ?? step.confidence ?? 0;
+  const selector = step.preview?.predicted_selector || step.selector || null;
+  return {
+    id: step.id,
+    order_index: step.order_index,
+    action: step.action,
+    name: step.name,
+    target_url: step.target_url,
+    selector: step.selector,
+    fallback_selectors: step.fallback_selectors || [],
+    selector_candidates: step.selector_candidates || [],
+    selector_is_unique: !!step.selector_is_unique,
+    text: step.text,
+    value: step.value,
+    element_context: step.element_context || null,
+    confidence,
+    llm_metadata: {
+      ...(step.llm_metadata || {}),
+      preview_selector: selector,
+      preview_reason: step.preview?.match_reason,
+      preview_provider: step.preview?.preview_metadata?.provider,
+    },
+    status: step.status || "ready",
+    preview: step.preview || null,
+  };
 }
 
-async function waitForLoopToStop(timeoutMs = 15000) {
-  const start = Date.now();
-  while (playerState.isLoopActive) {
-    if (Date.now() - start > timeoutMs) {
-      throw new Error("Timed out waiting for current run loop to stop.");
-    }
-    await delay(50);
-  }
+async function getWorkflowReview(workflowId) {
+  const workflow = await fetchJson(`${API_BASE}/workflows/${workflowId}/executable`);
+  const preview = await fetchJson(`${API_BASE}/workflows/${workflowId}/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ simulated_dom: [] }),
+  });
+  const steps = sortSteps(preview.steps || workflow.steps || []).map(stepReviewSummary);
+  const review = {
+    workflowId,
+    name: workflow.name,
+    description: workflow.description,
+    status: workflow.status,
+    requiresReview: workflow.requires_review,
+    sourceUrl: workflow.source_url,
+    steps,
+  };
+  await chrome.storage.local.set({ lastReview: review, lastWorkflowId: workflowId });
+  return review;
 }
 
-async function withControlLock(fn) {
-  if (playerState.controlLock) {
-    throw new Error("Another player action is already in progress.");
-  }
-
-  playerState.controlLock = true;
-  try {
-    return await fn();
-  } finally {
-    playerState.controlLock = false;
-  }
-}
-
-async function pauseLoopIfRunning(pauseMessage = "Workflow paused.") {
-  if (playerState.status === "running") {
-    playerState.status = "paused";
-    invalidateRunningLoop();
-    await waitForLoopToStop();
-    await updateStepProgress({
-      phase: "paused",
-      message: pauseMessage,
-      workflowId: playerState.workflowId,
-      currentStepIndex: playerState.currentStepIndex,
-      totalSteps: playerState.totalSteps,
-      completedSteps: playerState.currentStepIndex,
-    });
-  }
+async function saveWorkflowReview(workflowId, steps, markReviewed = true) {
+  const payload = {
+    mark_reviewed: !!markReviewed,
+    steps: sortSteps(steps).map((step, index) => ({
+      id: step.id,
+      order_index: index,
+      action: step.action,
+      name: step.name,
+      target_url: step.target_url,
+      selector: step.selector,
+      fallback_selectors: step.fallback_selectors || [],
+      selector_candidates: step.selector_candidates || [],
+      selector_is_unique: !!step.selector_is_unique,
+      text: step.text,
+      value: step.value,
+      element_context: step.element_context || null,
+      confidence: Number(step.confidence ?? step.preview?.confidence ?? 50),
+      llm_metadata: step.llm_metadata || {},
+      status: step.status || "ready",
+    })),
+  };
+  const result = await fetchJson(`${API_BASE}/workflows/${workflowId}/steps`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const review = {
+    workflowId,
+    status: result.status,
+    requiresReview: result.status !== "reviewed",
+    steps: sortSteps(result.steps || []).map(stepReviewSummary),
+  };
+  const existing = (await chrome.storage.local.get(["lastReview"]))?.lastReview || {};
+  await chrome.storage.local.set({ lastReview: { ...existing, ...review } });
+  return result;
 }
 
 async function loadWorkflowIntoPlayer(workflowId) {
   const workflow = await fetchJson(`${API_BASE}/workflows/${workflowId}/executable`);
   const steps = sortSteps(workflow.steps);
-
-  if (!steps.length) {
-    throw new Error("Workflow has no executable steps.");
-  }
-
+  if (!steps.length) throw new Error("Workflow has no executable steps.");
   const firstNavigate = steps.find((step) => step.action === "navigate" && step.target_url);
   const startUrl = firstNavigate?.target_url || workflow.source_url;
-
-  if (!startUrl) {
-    throw new Error("No start URL found for workflow.");
-  }
+  if (!startUrl) throw new Error("No start URL found for workflow.");
 
   playerState.status = "loading";
-  await updateStepProgress({
-    phase: "fetching",
-    message: `Loading workflow ${workflowId}...`,
-    workflowId,
-  });
+  await updateRunStatus({ phase: "fetching", message: `Loading workflow ${workflowId}...`, workflowId });
 
   const tab = await chrome.tabs.create({ url: startUrl, active: true });
   await waitForTabComplete(tab.id);
+  await injectPageHelper(tab.id);
 
   playerState.workflowId = workflowId;
   playerState.tabId = tab.id;
   playerState.steps = steps;
-  playerState.status = "paused";
   playerState.currentStepIndex = 0;
   playerState.totalSteps = steps.length;
-  playerState.workflowMeta = workflow;
-  invalidateRunningLoop();
+  playerState.status = "paused";
 
-  await updateStepProgress({
-    phase: "paused",
-    message: `Workflow ${workflowId} loaded locally.`,
+  await updateRunStatus({
+    phase: "ready",
+    message: workflow.requires_review
+      ? "Workflow loaded, but it should be reviewed before running."
+      : "Workflow loaded and ready to run.",
     workflowId,
     currentStepIndex: 0,
     totalSteps: steps.length,
-    completedSteps: 0,
   });
 
-  return { workflowId, totalSteps: steps.length, tabId: tab.id };
+  return { workflowId, totalSteps: steps.length, startUrl, status: playerState.status };
 }
 
-async function executeStepAtIndex(index, runTokenAtStart = null) {
-  if (!playerState.steps.length) {
-    throw new Error("No loaded workflow.");
-  }
-  if (index < 0 || index >= playerState.steps.length) {
-    throw new Error("Step index out of range.");
-  }
-  if (!playerState.tabId) {
-    throw new Error("No active workflow tab.");
+async function highlightWorkflowStep(workflowId, stepIndex) {
+  const review = await getWorkflowReview(workflowId);
+  const step = review.steps[stepIndex];
+  if (!step) throw new Error("Step not found.");
+
+  let tabId = playerState.tabId;
+  if (!tabId) {
+    const startUrl = step.target_url || review.sourceUrl || review.steps.find((item) => item.action === "navigate")?.target_url;
+    const tab = await chrome.tabs.create({ url: startUrl || "about:blank", active: true });
+    tabId = tab.id;
+    playerState.tabId = tabId;
+    await waitForTabComplete(tabId);
   }
 
-  const step = playerState.steps[index];
-
-  await updateStepProgress({
-    phase: "running",
-    message: `Running step ${index + 1} of ${playerState.totalSteps}: ${step.name || step.action}`,
-    workflowId: playerState.workflowId,
-    currentStepIndex: index,
-    totalSteps: playerState.totalSteps,
+  if (step.target_url && step.action !== "navigate") await ensureStepPage(tabId, step);
+  const result = await runInPage(tabId, "__observeAiHighlightStep", step);
+  await updateRunStatus({
+    phase: "reviewing",
+    workflowId,
+    currentStepIndex: stepIndex,
+    totalSteps: review.steps.length,
     currentStep: step,
-    completedSteps: index,
+    message: result?.message || `Highlighted step ${stepIndex + 1}.`,
   });
+  return { workflowId, stepIndex, step, highlight: result };
+}
 
-  if (runTokenAtStart !== null && runTokenAtStart !== playerState.runToken) {
-    return;
-  }
-
+async function executeCurrentStep(step) {
+  if (!playerState.tabId) throw new Error("No active workflow tab.");
   if (step.action === "navigate") {
     if (step.target_url) {
       await chrome.tabs.update(playerState.tabId, { url: step.target_url });
       await waitForTabComplete(playerState.tabId);
     }
-  } else {
-    await ensureStepPage(playerState.tabId, step);
-
-    const beforeTab = await chrome.tabs.get(playerState.tabId);
-    const beforeUrl = beforeTab.url || "";
-
-    if (runTokenAtStart !== null && runTokenAtStart !== playerState.runToken) {
-      return;
-    }
-
-    await resolveAndExecuteInPage(playerState.tabId, step);
-
-    const { stepDelayMs } = await getPlayerConfig();
-    await delay(stepDelayMs);
-
-    const afterTab = await chrome.tabs.get(playerState.tabId);
-    const afterUrl = afterTab.url || "";
-
-    if (afterUrl !== beforeUrl) {
-      await waitForTabComplete(playerState.tabId);
-    }
+    return { ok: true, usedSelector: null };
   }
-
-  const { stepDelayMs } = await getPlayerConfig();
-  await delay(stepDelayMs);
+  await ensureStepPage(playerState.tabId, step);
+  return await runInPage(playerState.tabId, "__observeAiExecuteStep", step);
 }
 
-async function runLoop(runToken) {
-  if (playerState.isLoopActive) return;
+async function runLoop(fromCurrent = true) {
+  const currentToken = ++playerState.runToken;
   playerState.isLoopActive = true;
-
+  playerState.status = "running";
+  const { stepDelayMs } = await getPlayerConfig();
   try {
-    while (playerState.status === "running" && runToken === playerState.runToken) {
-      if (playerState.currentStepIndex >= playerState.totalSteps) {
-        playerState.status = "finished";
-        await updateStepProgress({
-          phase: "success",
-          message: `Workflow ${playerState.workflowId} completed locally.`,
-          workflowId: playerState.workflowId,
-          currentStepIndex: playerState.totalSteps,
-          totalSteps: playerState.totalSteps,
-          completedSteps: playerState.totalSteps,
-        });
-        break;
-      }
-
-      const currentIndex = playerState.currentStepIndex;
-      await executeStepAtIndex(currentIndex, runToken);
-
-      if (runToken !== playerState.runToken || playerState.status !== "running") {
-        break;
-      }
-
-      playerState.currentStepIndex += 1;
-
-      await updateStepProgress({
+    for (let index = fromCurrent ? playerState.currentStepIndex : 0; index < playerState.steps.length; index += 1) {
+      if (playerState.runToken !== currentToken) break;
+      const step = playerState.steps[index];
+      playerState.currentStepIndex = index;
+      await updateRunStatus({
         phase: "running",
         workflowId: playerState.workflowId,
-        currentStepIndex: playerState.currentStepIndex,
+        currentStepIndex: index,
         totalSteps: playerState.totalSteps,
-        completedSteps: playerState.currentStepIndex,
+        currentStep: step,
+        message: `Running step ${index + 1}: ${step.name || step.action}`,
+      });
+      await clearPageHighlight(playerState.tabId);
+      await executeCurrentStep(step);
+      await delay(stepDelayMs);
+    }
+    if (playerState.runToken === currentToken && playerState.currentStepIndex >= playerState.steps.length - 1) {
+      playerState.status = "finished";
+      await updateRunStatus({
+        phase: "finished",
+        workflowId: playerState.workflowId,
+        currentStepIndex: playerState.steps.length - 1,
+        totalSteps: playerState.totalSteps,
+        completedSteps: playerState.totalSteps,
+        message: "Workflow finished.",
       });
     }
-  } catch (error) {
-    playerState.status = "error";
-    await updateStepProgress({
-      phase: "error",
-      message: error?.message || String(error),
-      workflowId: playerState.workflowId,
-      currentStepIndex: playerState.currentStepIndex,
-      totalSteps: playerState.totalSteps,
-    });
   } finally {
     playerState.isLoopActive = false;
   }
 }
 
-async function replayToStep(targetIndex) {
-  if (!playerState.steps.length) throw new Error("No loaded workflow.");
-  if (targetIndex < 0 || targetIndex >= playerState.totalSteps) {
-    throw new Error("Target step out of range.");
-  }
-  if (!playerState.tabId) throw new Error("No active workflow tab.");
-
-  await pauseLoopIfRunning("Workflow paused for replay.");
-
-  playerState.status = "jumping";
+async function resetPlayer() {
   invalidateRunningLoop();
-
-  await updateStepProgress({
-    phase: "jumping",
-    message: `Jumping to step ${targetIndex + 1}...`,
-    workflowId: playerState.workflowId,
-    currentStepIndex: targetIndex,
-    totalSteps: playerState.totalSteps,
-    completedSteps: targetIndex,
-  });
-
-  const firstNavigate = playerState.steps.find((step) => step.action === "navigate" && step.target_url);
-  const startUrl = firstNavigate?.target_url || playerState.workflowMeta?.source_url;
-  if (!startUrl) throw new Error("No start URL found for replay.");
-
-  await chrome.tabs.update(playerState.tabId, { url: startUrl });
-  await waitForTabComplete(playerState.tabId);
-
-  for (let i = 0; i < targetIndex; i += 1) {
-    await executeStepAtIndex(i, null);
-  }
-
-  playerState.currentStepIndex = targetIndex;
-  playerState.status = "paused";
-
-  await updateStepProgress({
-    phase: "paused",
-    message: `Paused at step ${targetIndex + 1}.`,
-    workflowId: playerState.workflowId,
-    currentStepIndex: targetIndex,
-    totalSteps: playerState.totalSteps,
-    completedSteps: targetIndex,
-  });
+  await waitForLoopToStop().catch(() => {});
+  await clearPageHighlight(playerState.tabId);
+  playerState.status = "idle";
+  playerState.currentStepIndex = 0;
+  playerState.totalSteps = playerState.steps.length;
 }
 
-async function startLocalRun(workflowId) {
-  return withControlLock(async () => {
-    invalidateRunningLoop();
-    await waitForLoopToStop().catch(() => {});
-
-    await updateStepProgress({
-      phase: "fetching",
-      message: `Fetching workflow ${workflowId}...`,
-      workflowId,
-    });
-
-    await loadWorkflowIntoPlayer(workflowId);
-
-    playerState.status = "running";
-    const token = ++playerState.runToken;
-    runLoop(token);
-
-    return { workflowId, totalSteps: playerState.totalSteps };
-  });
-}
-
-async function playerPlay() {
-  return withControlLock(async () => {
-    if (!playerState.steps.length) throw new Error("No workflow loaded.");
-
-    if (playerState.status === "running") {
-      return { ok: true, currentStepIndex: playerState.currentStepIndex };
-    }
-
-    if (playerState.status === "finished") {
-      playerState.currentStepIndex = 0;
-    }
-
-    playerState.status = "running";
-    const token = ++playerState.runToken;
-
-    await updateStepProgress({
-      phase: "running",
-      message: "Resuming workflow execution...",
-      workflowId: playerState.workflowId,
-      currentStepIndex: playerState.currentStepIndex,
-      totalSteps: playerState.totalSteps,
-      completedSteps: playerState.currentStepIndex,
-    });
-
-    runLoop(token);
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-async function playerPause() {
-  return withControlLock(async () => {
-    if (!playerState.steps.length) throw new Error("No workflow loaded.");
-    await pauseLoopIfRunning("Workflow paused.");
-    playerState.status = "paused";
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-async function playerStop() {
-  return withControlLock(async () => {
-    invalidateRunningLoop();
-    await waitForLoopToStop().catch(() => {});
-    playerState.status = "stopped";
-
-    await updateStepProgress({
-      phase: "stopped",
-      message: "Workflow stopped.",
-      workflowId: playerState.workflowId,
-      currentStepIndex: playerState.currentStepIndex,
-      totalSteps: playerState.totalSteps,
-      completedSteps: playerState.currentStepIndex,
-    });
-
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-async function playerNext() {
-  return withControlLock(async () => {
-    if (!playerState.steps.length) throw new Error("No workflow loaded.");
-    if (playerState.currentStepIndex >= playerState.totalSteps) {
-      throw new Error("Already at the end of the workflow.");
-    }
-
-    await pauseLoopIfRunning("Workflow paused before executing next step.");
-
-    playerState.status = "paused";
-    await executeStepAtIndex(playerState.currentStepIndex, null);
-    playerState.currentStepIndex += 1;
-
-    await updateStepProgress({
-      phase: "paused",
-      message: "Executed one step.",
-      workflowId: playerState.workflowId,
-      currentStepIndex: playerState.currentStepIndex,
-      totalSteps: playerState.totalSteps,
-      completedSteps: playerState.currentStepIndex,
-    });
-
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-async function playerPrev() {
-  return withControlLock(async () => {
-    if (!playerState.steps.length) throw new Error("No workflow loaded.");
-    const targetIndex = Math.max(0, playerState.currentStepIndex - 1);
-    await replayToStep(targetIndex);
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-async function playerJump(stepIndex) {
-  return withControlLock(async () => {
-    if (!playerState.steps.length) throw new Error("No workflow loaded.");
-
-    const safeIndex = Number(stepIndex);
-    if (!Number.isInteger(safeIndex)) {
-      throw new Error("Jump step must be an integer.");
-    }
-
-    await replayToStep(safeIndex);
-    return { ok: true, currentStepIndex: playerState.currentStepIndex };
-  });
-}
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
-    try {
-      if (message.type === "RECORDED_STEP") {
-        const { recording, steps = [] } = await chrome.storage.local.get(["recording", "steps"]);
-        if (!recording) {
-          sendResponse({ ok: false });
-          return;
-        }
-        const next = [...steps, message.payload];
-        await chrome.storage.local.set({ steps: next });
-        sendResponse({ ok: true, count: next.length });
-        return;
+    switch (message?.type) {
+      case "RECORDED_STEP": {
+        const storage = await chrome.storage.local.get(["recording", "steps"]);
+        if (!storage.recording) return sendResponse({ ok: true, ignored: true });
+        const steps = Array.isArray(storage.steps) ? storage.steps : [];
+        steps.push(message.payload);
+        await chrome.storage.local.set({ steps });
+        return sendResponse({ ok: true, stepCount: steps.length });
       }
-
-      if (message.type === "START_RECORDING") {
+      case "START_RECORDING": {
         await chrome.storage.local.set({ recording: true, steps: [], localRunStatus: null });
-        sendResponse({ ok: true });
-        return;
+        return sendResponse({ ok: true });
       }
-
-      if (message.type === "STOP_RECORDING") {
+      case "STOP_RECORDING": {
         await chrome.storage.local.set({ recording: false });
-        sendResponse({ ok: true });
-        return;
+        return sendResponse({ ok: true });
       }
-
-      if (message.type === "UPLOAD_AND_PROCESS_WORKFLOW") {
-        const result = await uploadAndProcessWorkflow(message.payload || {});
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "RUN_WORKFLOW_LOCALLY") {
-        const result = await startLocalRun(message.workflowId);
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_PLAY") {
-        const result = await playerPlay();
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_PAUSE") {
-        const result = await playerPause();
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_STOP") {
-        const result = await playerStop();
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_NEXT") {
-        const result = await playerNext();
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_PREV") {
-        const result = await playerPrev();
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "PLAYER_JUMP") {
-        const result = await playerJump(Number(message.stepIndex));
-        sendResponse({ ok: true, data: result });
-        return;
-      }
-
-      if (message.type === "GET_LOCAL_RUN_STATUS") {
-        sendResponse({ ok: true, data: await getRunStatus() });
-        return;
-      }
-
-      if (message.type === "GET_RECORDING_STATE") {
+      case "GET_RECORDING_STATE": {
         const data = await chrome.storage.local.get(["recording", "steps", "lastWorkflowId"]);
-        sendResponse({
+        return sendResponse({
           ok: true,
           data: {
             recording: !!data.recording,
@@ -747,30 +584,105 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             lastWorkflowId: data.lastWorkflowId || null,
           },
         });
-        return;
       }
-
-      if (message.type === "GET_PLAYER_CONFIG") {
-        sendResponse({ ok: true, data: await getPlayerConfig() });
-        return;
+      case "UPLOAD_AND_PROCESS_WORKFLOW": {
+        const data = await uploadAndProcessWorkflow(message.payload || {});
+        return sendResponse({ ok: true, data });
       }
-
-      if (message.type === "SET_PLAYER_CONFIG") {
-        const result = await setPlayerConfig(message.config || {});
-        sendResponse({ ok: true, data: result });
-        return;
+      case "GET_LOCAL_RUN_STATUS": {
+        return sendResponse({ ok: true, data: await getRunStatus() });
       }
-
-      sendResponse({ ok: false, error: "Unknown message type" });
-    } catch (error) {
-      console.error(error);
-      await updateStepProgress({
-        phase: "error",
-        message: error?.message || "Unknown error",
-      });
-      sendResponse({ ok: false, error: error?.message || String(error) });
+      case "GET_PLAYER_CONFIG": {
+        return sendResponse({ ok: true, data: await getPlayerConfig() });
+      }
+      case "SET_PLAYER_CONFIG": {
+        return sendResponse({ ok: true, data: await setPlayerConfig(message.config || {}) });
+      }
+      case "GET_WORKFLOW_REVIEW": {
+        const data = await getWorkflowReview(Number(message.workflowId));
+        return sendResponse({ ok: true, data });
+      }
+      case "SAVE_WORKFLOW_REVIEW": {
+        const data = await saveWorkflowReview(Number(message.workflowId), message.steps || [], !!message.markReviewed);
+        return sendResponse({ ok: true, data });
+      }
+      case "HIGHLIGHT_REVIEW_STEP": {
+        const data = await highlightWorkflowStep(Number(message.workflowId), Number(message.stepIndex || 0));
+        return sendResponse({ ok: true, data });
+      }
+      case "CLEAR_HIGHLIGHT": {
+        await clearPageHighlight(playerState.tabId);
+        return sendResponse({ ok: true });
+      }
+      case "RUN_WORKFLOW_LOCALLY": {
+        const workflowId = Number(message.workflowId);
+        const review = await getWorkflowReview(workflowId);
+        if (review.requiresReview) {
+          return sendResponse({ ok: false, error: "Review and approve the workflow before running it." });
+        }
+        const data = await loadWorkflowIntoPlayer(workflowId);
+        return sendResponse({ ok: true, data });
+      }
+      case "APPROVE_AND_RUN_WORKFLOW": {
+        const workflowId = Number(message.workflowId);
+        await saveWorkflowReview(workflowId, message.steps || [], true);
+        const data = await loadWorkflowIntoPlayer(workflowId);
+        return sendResponse({ ok: true, data });
+      }
+      case "PLAYER_PLAY": {
+        return sendResponse({ ok: true, data: await withControlLock(async () => {
+          if (!playerState.steps.length) throw new Error("Load a workflow first.");
+          await pauseLoopIfRunning();
+          runLoop(true);
+          return { status: "running" };
+        }) });
+      }
+      case "PLAYER_PAUSE": {
+        await withControlLock(() => pauseLoopIfRunning());
+        return sendResponse({ ok: true });
+      }
+      case "PLAYER_STOP": {
+        await withControlLock(async () => {
+          await resetPlayer();
+          await updateRunStatus({ phase: "stopped", workflowId: playerState.workflowId, message: "Workflow stopped." });
+        });
+        return sendResponse({ ok: true });
+      }
+      case "PLAYER_NEXT": {
+        await withControlLock(async () => {
+          await pauseLoopIfRunning();
+          if (!playerState.steps.length) throw new Error("Load a workflow first.");
+          const index = Math.min(playerState.currentStepIndex, playerState.steps.length - 1);
+          const step = playerState.steps[index];
+          playerState.currentStepIndex = index;
+          await executeCurrentStep(step);
+          await updateRunStatus({ phase: "paused", workflowId: playerState.workflowId, currentStepIndex: index, totalSteps: playerState.totalSteps, currentStep: step, message: `Executed step ${index + 1}.` });
+          playerState.currentStepIndex = Math.min(index + 1, playerState.steps.length - 1);
+        });
+        return sendResponse({ ok: true });
+      }
+      case "PLAYER_PREV": {
+        await withControlLock(async () => {
+          await pauseLoopIfRunning();
+          if (!playerState.steps.length) throw new Error("Load a workflow first.");
+          playerState.currentStepIndex = Math.max(playerState.currentStepIndex - 1, 0);
+          await updateRunStatus({ phase: "paused", workflowId: playerState.workflowId, currentStepIndex: playerState.currentStepIndex, totalSteps: playerState.totalSteps, currentStep: playerState.steps[playerState.currentStepIndex], message: `Moved to step ${playerState.currentStepIndex + 1}.` });
+        });
+        return sendResponse({ ok: true });
+      }
+      case "PLAYER_JUMP": {
+        await withControlLock(async () => {
+          await pauseLoopIfRunning();
+          if (!playerState.steps.length) throw new Error("Load a workflow first.");
+          const index = Math.max(0, Math.min(Number(message.stepIndex || 0), playerState.steps.length - 1));
+          playerState.currentStepIndex = index;
+          await updateRunStatus({ phase: "jumping", workflowId: playerState.workflowId, currentStepIndex: index, totalSteps: playerState.totalSteps, currentStep: playerState.steps[index], message: `Jumped to step ${index + 1}.` });
+        });
+        return sendResponse({ ok: true });
+      }
+      default:
+        return sendResponse({ ok: false, error: "Unknown message type." });
     }
-  })();
-
+  })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
   return true;
 });

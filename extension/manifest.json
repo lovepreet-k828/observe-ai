@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "ScreenCoPilot",
-  "version": "1.0.0",
-  "description": "Record, upload, process, and locally run browser workflows.",
+  "name": "ObserveAI",
+  "version": "1.1.0",
+  "description": "Record, review, approve, and locally run browser workflows with Ghost Mode.",
   "permissions": [
     "storage",
     "tabs",
@@ -22,8 +22,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["recorder.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "recorder.js"
+      ],
       "run_at": "document_start"
     }
   ]

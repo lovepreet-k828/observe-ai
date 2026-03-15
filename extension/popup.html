@@ -2,156 +2,97 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>ScreenCoPilot</title>
+    <title>ObserveAI</title>
     <style>
-      body {
-        font-family: Arial, sans-serif;
-        width: 340px;
-        margin: 0;
-        padding: 14px;
-        background: #f8fafc;
-        color: #0f172a;
-      }
-
-      h2 {
-        margin: 0 0 12px;
-        font-size: 18px;
-      }
-
-      .section {
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 12px;
-        margin-bottom: 12px;
-      }
-
-      .row {
-        display: flex;
-        gap: 8px;
-        margin-bottom: 8px;
-      }
-
-      button {
-        border: none;
-        border-radius: 8px;
-        padding: 10px 12px;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 600;
-        flex: 1;
-      }
-
-      .primary {
-        background: #2563eb;
-        color: white;
-      }
-
-      .secondary {
-        background: #e2e8f0;
-        color: #0f172a;
-      }
-
-      .danger {
-        background: #dc2626;
-        color: white;
-      }
-
-      input {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 10px;
-        border-radius: 8px;
-        border: 1px solid #cbd5e1;
-        margin-bottom: 8px;
-      }
-
-      .status {
-        font-size: 13px;
-        line-height: 1.4;
-        white-space: pre-wrap;
-      }
-
-      .muted {
-        color: #475569;
-        font-size: 12px;
-      }
-
-      .spinner {
-        display: inline-block;
-        width: 14px;
-        height: 14px;
-        border: 2px solid #cbd5e1;
-        border-top-color: #2563eb;
-        border-radius: 999px;
-        animation: spin 1s linear infinite;
-        vertical-align: middle;
-        margin-right: 8px;
-      }
-
-      .hidden {
-        display: none;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
-
-      .small {
-        font-size: 12px;
-      }
+      body { font-family: Arial, sans-serif; width: 420px; margin: 0; padding: 14px; background: #f8fafc; color: #0f172a; }
+      h2 { margin: 0 0 12px; font-size: 20px; }
+      .section { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; margin-bottom: 12px; }
+      .row { display: flex; gap: 8px; margin-bottom: 8px; }
+      button { border: none; border-radius: 8px; padding: 10px 12px; cursor: pointer; font-size: 13px; font-weight: 600; flex: 1; }
+      .primary { background: #2563eb; color: white; }
+      .secondary { background: #e2e8f0; color: #0f172a; }
+      .danger { background: #dc2626; color: white; }
+      input, textarea, select { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #cbd5e1; margin-bottom: 8px; font-size: 13px; }
+      textarea { resize: vertical; min-height: 56px; }
+      .status { font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+      .muted { color: #475569; font-size: 12px; }
+      .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #cbd5e1; border-top-color: #2563eb; border-radius: 999px; animation: spin 1s linear infinite; vertical-align: middle; margin-right: 8px; }
+      .hidden { display: none; }
+      .small { font-size: 12px; }
+      .review-card { border: 1px solid #dbe4f0; border-radius: 10px; padding: 10px; margin-bottom: 10px; background: #fbfdff; }
+      .review-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; align-items: center; }
+      .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+      .pill-high { background: #dcfce7; color: #166534; }
+      .pill-mid { background: #fef3c7; color: #92400e; }
+      .pill-low { background: #fee2e2; color: #991b1b; }
+      .label { font-size: 11px; color: #475569; margin-bottom: 4px; font-weight: 700; }
+      .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .review-actions { display: flex; gap: 8px; margin-top: 6px; }
+      .review-scroll { max-height: 380px; overflow: auto; padding-right: 4px; }
+      .title-row { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
+      @keyframes spin { to { transform: rotate(360deg); } }
     </style>
   </head>
   <body>
-    <h2>ScreenCoPilot</h2>
+    <h2>ObserveAI</h2>
 
     <div class="section">
       <div class="row">
         <button id="startRecording" class="primary">Start Recording</button>
-        <button id="stopUpload" class="secondary">Stop & Upload</button>
+        <button id="stopUpload" class="secondary">Stop &amp; Upload</button>
       </div>
       <div class="muted" id="recordingInfo">Not recording.</div>
     </div>
 
     <div class="section">
       <input id="workflowIdInput" type="number" placeholder="Workflow ID" />
-
       <div class="row">
-        <button id="runLocal" class="primary">Run Locally</button>
+        <button id="loadReview" class="secondary">Load Review</button>
+        <button id="runLocal" class="primary">Load Player</button>
       </div>
+      <div class="muted">Before running, review steps, highlight targets, edit if needed, then approve.</div>
+    </div>
 
+    <div class="section" id="reviewSection">
+      <div class="title-row">
+        <div>
+          <div style="font-weight:700;">Ghost Mode Review</div>
+          <div class="muted" id="reviewMeta">No workflow loaded.</div>
+        </div>
+      </div>
+      <div class="row">
+        <button id="saveReview" class="secondary">Save Edits</button>
+        <button id="approveRun" class="primary">Approve &amp; Load Player</button>
+      </div>
+      <div class="row">
+        <button id="clearHighlight" class="secondary">Clear Highlight</button>
+      </div>
+      <div id="reviewList" class="review-scroll muted">Load a workflow review to inspect generated steps.</div>
+    </div>
+
+    <div class="section">
       <div class="row">
         <button id="playBtn" class="primary">Play</button>
         <button id="pauseBtn" class="secondary">Pause</button>
       </div>
-
       <div class="row">
         <button id="prevBtn" class="secondary">Prev</button>
         <button id="nextBtn" class="secondary">Next</button>
       </div>
-
       <div class="row">
         <button id="stopBtn" class="danger">Stop</button>
       </div>
-
       <input id="jumpStepInput" type="number" min="0" placeholder="Jump to step index" />
       <div class="row">
         <button id="jumpBtn" class="secondary">Jump To Step</button>
       </div>
-
-      <div style="font-size:13px; font-weight:600; margin-bottom:6px; color:#0f172a;">
-  Delay after each workflow step (ms)
-</div>
-<input id="stepDelayInput" type="number" min="0" step="100" placeholder="e.g. 1000" />
-<div class="muted">1000 = 1 second, 2000 = 2 seconds</div>
+      <div style="font-size:13px; font-weight:600; margin-bottom:6px; color:#0f172a;">Delay after each workflow step (ms)</div>
+      <input id="stepDelayInput" type="number" min="0" step="100" placeholder="e.g. 1000" />
+      <div class="muted">1000 = 1 second, 2000 = 2 seconds</div>
     </div>
 
     <div class="section">
-      <div id="spinnerWrap" class="hidden">
-        <span class="spinner"></span><span class="small">Working...</span>
-      </div>
+      <div id="spinnerWrap" class="hidden"><span class="spinner"></span><span class="small">Working...</span></div>
       <div id="status" class="status">Idle.</div>
     </div>
 

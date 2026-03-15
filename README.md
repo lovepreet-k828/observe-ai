@@ -52,7 +52,7 @@ A Chrome extension records user actions directly from the browser.
 Recorded steps are normalized into a cleaner workflow using **Amazon Nova Lite** and rule-based preprocessing.
 
 ### 3. Ghost Mode preview
-ObserveAI can generate a step-by-step preview before execution so users can inspect the planned automation.
+ObserveAI can generate a step-by-step preview before execution so users can inspect the planned automation. The current implementation now includes an editable pre-run approval flow inside the extension.
 
 ### 4. Local execution in the client browser
 Workflows can run directly inside the user’s Chrome session through the extension, which is useful for workflows that depend on the user’s own cookies, sessions, and permissions.
@@ -468,3 +468,14 @@ uvicorn app.main:app --reload --port 8000
 
 > **ObserveAI turns observed browser behavior into trustworthy, reusable automation.**
 
+
+
+## Added in this updated build
+
+- Ghost Mode review panel in the Chrome extension
+- Step-by-step pre-run approval flow
+- Highlight target element before execution
+- Confidence score display for every generated step
+- Editable selector, action, URL, and value fields
+- Save edits back to the backend before running
+- Approval gate so workflows are reviewed before player execution

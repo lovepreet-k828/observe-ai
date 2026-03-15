@@ -20,6 +20,7 @@ class GhostService:
             confidence = score_selector(selector)
             match_reason = "Primary selector chosen from recording."
             provider = "recorded-selector"
+            rect = ((step.get("element_context") or {}).get("rect") or None)
 
             if step.get("action") == "navigate":
                 confidence = 99
@@ -43,6 +44,9 @@ class GhostService:
                         "fallback_count": len(step.get("fallback_selectors") or []),
                         "selector_candidates": len(step.get("selector_candidates") or []),
                         "provider": provider,
+                        "action": step.get("action"),
+                        "rect": rect,
+                        "target_url": step.get("target_url"),
                     },
                 }
             )

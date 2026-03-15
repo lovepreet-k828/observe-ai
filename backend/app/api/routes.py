@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.session import get_db
@@ -43,6 +43,29 @@ class CreateWorkflowRequest(BaseModel):
 
 class PreviewWorkflowRequest(BaseModel):
     simulated_dom: Optional[List[Dict[str, Any]]] = None
+
+
+class EditableWorkflowStep(BaseModel):
+    id: Optional[int] = None
+    order_index: int = 0
+    action: str
+    name: Optional[str] = None
+    target_url: Optional[str] = None
+    selector: Optional[str] = None
+    fallback_selectors: List[str] = Field(default_factory=list)
+    selector_candidates: List[Dict[str, Any] | str] = Field(default_factory=list)
+    selector_is_unique: bool = False
+    text: Optional[str] = None
+    value: Optional[str] = None
+    element_context: Optional[Dict[str, Any]] = None
+    confidence: int = 50
+    llm_metadata: Optional[Dict[str, Any]] = None
+    status: str = "ready"
+
+
+class UpdateWorkflowStepsRequest(BaseModel):
+    steps: List[EditableWorkflowStep]
+    mark_reviewed: bool = True
 
 
 class RunWorkflowRequest(BaseModel):
@@ -155,10 +178,7 @@ def _extract_direct_href(raw: RawStep) -> Optional[str]:
 
 
 def _normalize_start_url(raw_steps: List[RawStep], source_url: Optional[str]) -> Optional[str]:
-    first_non_google = next(
-        (s.url for s in raw_steps if s.url and not _is_google_search_url(s.url)),
-        None,
-    )
+    first_non_google = next((s.url for s in raw_steps if s.url and not _is_google_search_url(s.url)), None)
     first_any = next((s.url for s in raw_steps if s.url), None)
     return first_non_google or first_any or source_url
 
@@ -166,7 +186,6 @@ def _normalize_start_url(raw_steps: List[RawStep], source_url: Optional[str]) ->
 def _step_display_name_from_raw(raw: RawStep) -> str:
     if raw.action == "navigate":
         return f"Navigate to {raw.url or 'page'}"
-
     if raw.action == "input":
         ctx = raw.element_context or {}
         label = (
@@ -178,24 +197,14 @@ def _step_display_name_from_raw(raw: RawStep) -> str:
             or "field"
         )
         return f"Type into {str(label)[:60]}"
-
     if raw.action == "click":
         ctx = raw.element_context or {}
-        txt = (
-            _clean_text(raw.text)
-            or _clean_text(ctx.get("direct_text"))
-            or _clean_text(ctx.get("text"))
-            or raw.selector
-            or "element"
-        )
+        txt = _clean_text(raw.text) or _clean_text(ctx.get("direct_text")) or _clean_text(ctx.get("text")) or raw.selector or "element"
         return f"Click {txt[:80]}"
-
     if raw.action == "upload":
         return "Upload file"
-
     if raw.action == "select":
         return f"Select {_clean_text(raw.value)[:60] or 'option'}"
-
     return f"{raw.action.title()} step"
 
 
@@ -215,13 +224,7 @@ def _step_display_name_from_dict(step: Dict[str, Any]) -> str:
         return f"Type into {str(label)[:60]}"
     if action == "click":
         ctx = step.get("element_context") or {}
-        txt = (
-            _clean_text(step.get("text"))
-            or _clean_text(ctx.get("direct_text"))
-            or _clean_text(ctx.get("text"))
-            or step.get("selector")
-            or "element"
-        )
+        txt = _clean_text(step.get("text")) or _clean_text(ctx.get("direct_text")) or _clean_text(ctx.get("text")) or step.get("selector") or "element"
         return f"Click {txt[:80]}"
     if action == "upload":
         return "Upload file"
@@ -232,14 +235,11 @@ def _step_display_name_from_dict(step: Dict[str, Any]) -> str:
 
 def _merge_raw_steps(raw_steps: List[RawStep]) -> List[RawStep]:
     merged: List[RawStep] = []
-
     for step in raw_steps:
         if not merged:
             merged.append(step)
             continue
-
         prev = merged[-1]
-
         same_input_target = (
             step.action == "input"
             and prev.action == "input"
@@ -249,24 +249,16 @@ def _merge_raw_steps(raw_steps: List[RawStep]) -> List[RawStep]:
         if same_input_target:
             merged[-1] = step
             continue
-
-        same_navigate_target = (
-            step.action == "navigate"
-            and prev.action == "navigate"
-            and (step.url or "") == (prev.url or "")
-        )
+        same_navigate_target = step.action == "navigate" and prev.action == "navigate" and (step.url or "") == (prev.url or "")
         if same_navigate_target:
             merged[-1] = step
             continue
-
         merged.append(step)
-
     return merged
 
 
 def _rewrite_google_result_clicks(raw_steps: List[RawStep]) -> List[RawStep]:
     rewritten: List[RawStep] = []
-
     for raw in raw_steps:
         if raw.action == "click" and _is_google_search_url(raw.url):
             direct_href = _extract_direct_href(raw)
@@ -290,15 +282,12 @@ def _rewrite_google_result_clicks(raw_steps: List[RawStep]) -> List[RawStep]:
                     )
                 )
                 continue
-
         rewritten.append(raw)
-
     return rewritten
 
 
 def _fallback_process_from_raw(raw_steps: List[RawStep]) -> List[Dict[str, Any]]:
     processed: List[Dict[str, Any]] = []
-
     for raw in raw_steps:
         confidence = 35
         if raw.action == "navigate":
@@ -307,7 +296,6 @@ def _fallback_process_from_raw(raw_steps: List[RawStep]) -> List[Dict[str, Any]]
             confidence = 75
         elif raw.fallback_selectors:
             confidence = 55
-
         processed.append(
             {
                 "action": raw.action,
@@ -321,35 +309,26 @@ def _fallback_process_from_raw(raw_steps: List[RawStep]) -> List[Dict[str, Any]]
                 "value": raw.value,
                 "element_context": raw.element_context,
                 "confidence": confidence,
-                "llm_metadata": {
-                    "provider": "processor-fallback",
-                    "raw_action": raw.action,
-                },
+                "llm_metadata": {"provider": "processor-fallback", "raw_action": raw.action},
             }
         )
-
     return processed
 
 
 def _processed_step_target_url(item: Dict[str, Any], raw_steps: List[RawStep]) -> Optional[str]:
     action = item.get("action")
     target_url = item.get("target_url") or item.get("url")
-
     if action == "navigate":
         return target_url
-
     if target_url:
         return target_url
-
     selector = item.get("selector")
     for s in raw_steps:
         if s.action == action and s.selector == selector and s.url:
             return s.url
-
     for s in raw_steps:
         if s.action == action and s.url:
             return s.url
-
     return None
 
 
@@ -363,9 +342,7 @@ def _create_processed_steps(db: Session, workflow: Workflow) -> Workflow:
 
     raw_steps = _merge_raw_steps(raw_steps)
     raw_steps = _rewrite_google_result_clicks(raw_steps)
-
     start_url = _normalize_start_url(raw_steps, workflow.source_url)
-
     raw_payload = [_raw_step_to_dict(s) for s in raw_steps]
 
     try:
@@ -383,7 +360,6 @@ def _create_processed_steps(db: Session, workflow: Workflow) -> Workflow:
         generated_steps = _fallback_process_from_raw(raw_steps)
 
     order_index = 0
-
     if start_url:
         db.add(
             WorkflowStep(
@@ -400,31 +376,23 @@ def _create_processed_steps(db: Session, workflow: Workflow) -> Workflow:
                 value=None,
                 element_context=None,
                 confidence=99,
-                llm_metadata={
-                    "provider": "processor",
-                    "reason": "synthetic_start_navigation",
-                },
+                llm_metadata={"provider": "processor", "reason": "synthetic_start_navigation"},
                 status="ready",
             )
         )
         order_index += 1
 
     last_navigate = start_url
-
     for item in generated_steps:
         action = item.get("action")
         if not action:
             continue
-
         target_url = _processed_step_target_url(item, raw_steps)
-
         if action == "navigate":
             if not target_url or target_url == last_navigate:
                 continue
             last_navigate = target_url
-
         name = item.get("name") or _step_display_name_from_dict(item)
-
         db.add(
             WorkflowStep(
                 workflow_id=workflow.id,
@@ -451,6 +419,44 @@ def _create_processed_steps(db: Session, workflow: Workflow) -> Workflow:
     return _workflow_query(db).filter(Workflow.id == workflow.id).first()
 
 
+def _replace_workflow_steps(db: Session, workflow: Workflow, steps: List[EditableWorkflowStep], mark_reviewed: bool = True) -> Workflow:
+    safe_steps = [step for step in steps if step.action in SAFE_ACTIONS]
+    if not safe_steps:
+        raise HTTPException(status_code=400, detail="No valid workflow steps were provided")
+
+    db.query(WorkflowStep).filter(WorkflowStep.workflow_id == workflow.id).delete()
+    db.flush()
+
+    for order_index, step in enumerate(sorted(safe_steps, key=lambda item: item.order_index)):
+        name = step.name or _step_display_name_from_dict(step.model_dump())
+        db.add(
+            WorkflowStep(
+                workflow_id=workflow.id,
+                order_index=order_index,
+                action=step.action,
+                name=name,
+                target_url=step.target_url,
+                selector=step.selector,
+                fallback_selectors=step.fallback_selectors or [],
+                selector_candidates=step.selector_candidates or [],
+                selector_is_unique=bool(step.selector_is_unique),
+                text=step.text,
+                value=step.value,
+                element_context=step.element_context,
+                confidence=max(0, min(100, int(step.confidence))),
+                llm_metadata={
+                    **(step.llm_metadata or {}),
+                    "edited_by_user": True,
+                },
+                status=step.status or "ready",
+            )
+        )
+
+    workflow.status = "reviewed" if mark_reviewed else "processed"
+    db.commit()
+    return _workflow_query(db).filter(Workflow.id == workflow.id).first()
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -463,13 +469,7 @@ def create_workflow(payload: CreateWorkflowRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail="No valid recorded steps found")
 
     source_url = next((s.url for s in raw_steps if s.url), None) or payload.source_url
-
-    workflow = Workflow(
-        name=payload.name,
-        description=payload.description,
-        source_url=source_url,
-        status="recorded",
-    )
+    workflow = Workflow(name=payload.name, description=payload.description, source_url=source_url, status="recorded")
     db.add(workflow)
     db.flush()
 
@@ -535,26 +535,35 @@ def get_executable_workflow(workflow_id: int, db: Session = Depends(get_db)):
     workflow = _workflow_query(db).filter(Workflow.id == workflow_id).first()
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
-
     if not workflow.steps:
         workflow = _create_processed_steps(db, workflow)
-
     return {
         "workflow_id": workflow.id,
         "name": workflow.name,
         "description": workflow.description,
         "source_url": workflow.source_url,
         "status": workflow.status,
+        "requires_review": workflow.status != "reviewed",
+        "steps": [_step_to_dict(step) for step in sorted(workflow.steps, key=lambda s: s.order_index)],
+    }
+
+
+@router.put("/workflows/{workflow_id}/steps")
+def update_workflow_steps(workflow_id: int, payload: UpdateWorkflowStepsRequest, db: Session = Depends(get_db)):
+    workflow = _workflow_query(db).filter(Workflow.id == workflow_id).first()
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    workflow = _replace_workflow_steps(db, workflow, payload.steps, mark_reviewed=payload.mark_reviewed)
+    return {
+        "message": "Workflow steps updated successfully",
+        "workflow_id": workflow.id,
+        "status": workflow.status,
         "steps": [_step_to_dict(step) for step in sorted(workflow.steps, key=lambda s: s.order_index)],
     }
 
 
 @router.post("/workflows/{workflow_id}/preview")
-def preview_workflow(
-    workflow_id: int,
-    payload: PreviewWorkflowRequest,
-    db: Session = Depends(get_db),
-):
+def preview_workflow(workflow_id: int, payload: PreviewWorkflowRequest, db: Session = Depends(get_db)):
     workflow = _workflow_query(db).filter(Workflow.id == workflow_id).first()
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -563,11 +572,17 @@ def preview_workflow(
 
     step_payloads = [_step_to_dict(step) for step in sorted(workflow.steps, key=lambda s: s.order_index)]
     previews = ghost_service.build_preview(step_payloads, payload.simulated_dom or [])
+    preview_by_step = {preview["step_id"]: preview for preview in previews}
+    combined_steps = []
+    for step in step_payloads:
+        combined_steps.append({**step, "preview": preview_by_step.get(step["id"], {})})
     return {
         "workflow_id": workflow.id,
         "status": workflow.status,
+        "requires_review": workflow.status != "reviewed",
         "preview_count": len(previews),
         "previews": previews,
+        "steps": combined_steps,
     }
 
 
@@ -590,8 +605,4 @@ def run_workflow(workflow_id: int, payload: RunWorkflowRequest, db: Session = De
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     workflow = _workflow_query(db).filter(Workflow.id == workflow.id).first()
-    return {
-        "message": "Workflow run completed",
-        "run_result": result,
-        "workflow": _workflow_to_debug_dict(workflow),
-    }
+    return {"message": "Workflow run completed", "run_result": result, "workflow": _workflow_to_debug_dict(workflow)}
