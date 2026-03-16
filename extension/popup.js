@@ -27,6 +27,7 @@ const els = {
 };
 
 let currentReview = null;
+let highlightedStepIndex = null;
 
 function setSpinner(show) {
   els.spinnerWrap?.classList.toggle("hidden", !show);
@@ -62,8 +63,12 @@ function escapeHtml(value) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
+    .replace(/\"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function emptyReviewState(message = "Load a workflow review to inspect generated steps.") {
+  return `<div class="empty-state">${escapeHtml(message)}</div>`;
 }
 
 function getWorkflowIdFromInput() {
@@ -92,28 +97,50 @@ function collectReviewStepsFromDom() {
   });
 }
 
+async function persistPopupUiState() {
+  await chrome.storage.local.set({ popupUiState: { workflowId: getWorkflowIdFromInput(), highlightedStepIndex, updatedAt: Date.now() } });
+}
+
+function applyHighlightedReviewState() {
+  document.querySelectorAll(".review-card").forEach((card) => {
+    const idx = Number(card.dataset.stepIndex || -1);
+    card.classList.toggle("is-highlighted", idx === highlightedStepIndex);
+    const btn = card.querySelector(".action-highlight");
+    if (btn) btn.textContent = idx === highlightedStepIndex ? "Highlighted on page" : "Highlight";
+  });
+}
+
 function renderReview(review) {
   currentReview = review;
   if (!review || !Array.isArray(review.steps) || !review.steps.length) {
     els.reviewMeta.textContent = "No workflow loaded.";
-    els.reviewList.innerHTML = "Load a workflow review to inspect generated steps.";
+    els.reviewList.innerHTML = emptyReviewState();
     return;
   }
 
-  els.reviewMeta.textContent = `${review.steps.length} step(s) • ${review.requiresReview ? "Needs approval" : "Approved"}`;
+  const statusText = review.requiresReview ? "Needs approval" : "Approved";
+  els.reviewMeta.textContent = `${review.steps.length} step(s) • ${statusText}${review.sourceUrl ? ` • ${review.sourceUrl}` : ""}`;
   els.reviewList.innerHTML = review.steps
     .map((step, index) => {
       const confidence = step.preview?.confidence ?? step.confidence ?? 0;
       const predictedSelector = step.preview?.predicted_selector || step.selector || "";
       const reason = step.preview?.match_reason || "No match reason available.";
+      const provider = step.preview?.preview_metadata?.provider || step.llm_metadata?.provider || "recorded";
       return `
         <div class="review-card" data-step-index="${index}">
           <div class="review-head">
-            <div><strong>#${index + 1} ${escapeHtml(step.name || step.action)}</strong></div>
+            <div>
+              <div class="review-title">#${index + 1} ${escapeHtml(step.name || step.action)}</div>
+              <div class="review-meta">
+                <span class="meta-chip">${escapeHtml(step.action || "step")}</span>
+                <span class="meta-chip">provider: ${escapeHtml(provider)}</span>
+                ${step.target_url ? `<span class="meta-chip">page scoped</span>` : ""}
+              </div>
+            </div>
             <span class="${confidenceClass(confidence)}">${confidence}% confidence</span>
           </div>
-          <div class="two-col">
-            <div>
+          <div class="grid-2">
+            <div class="field-wrap">
               <div class="label">Action</div>
               <select class="field-action">
                 ${["navigate", "click", "input", "select", "upload"]
@@ -121,25 +148,33 @@ function renderReview(review) {
                   .join("")}
               </select>
             </div>
-            <div>
+            <div class="field-wrap">
               <div class="label">Name</div>
               <input class="field-name" value="${escapeHtml(step.name || "")}" />
             </div>
           </div>
-          <div class="label">Target URL</div>
-          <input class="field-url" value="${escapeHtml(step.target_url || "")}" />
-          <div class="label">Selector / highlighted element</div>
-          <textarea class="field-selector">${escapeHtml(predictedSelector)}</textarea>
-          <div class="label">Value / text to type</div>
-          <input class="field-value" value="${escapeHtml(step.value || step.text || "")}" />
-          <div class="muted">${escapeHtml(reason)}</div>
-          <div class="review-actions">
+          <div class="field-wrap">
+            <div class="label">Target URL</div>
+            <input class="field-url" value="${escapeHtml(step.target_url || "")}" />
+          </div>
+          <div class="field-wrap">
+            <div class="label">Selector / highlighted element</div>
+            <textarea class="field-selector">${escapeHtml(predictedSelector)}</textarea>
+          </div>
+          <div class="field-wrap">
+            <div class="label">Value / text to type</div>
+            <input class="field-value" value="${escapeHtml(step.value || step.text || "")}" />
+          </div>
+          <div class="small-muted">${escapeHtml(reason)}</div>
+          <div class="row" style="margin-top:10px; margin-bottom:0;">
             <button class="secondary action-highlight" data-step-index="${index}">Highlight</button>
           </div>
         </div>
       `;
     })
     .join("");
+
+  applyHighlightedReviewState();
 
   [...document.querySelectorAll(".action-highlight")].forEach((button) => {
     button.addEventListener("click", async () => {
@@ -149,7 +184,8 @@ function renderReview(review) {
         setSpinner(true);
         const res = await sendMessage({ type: "HIGHLIGHT_REVIEW_STEP", workflowId, stepIndex });
         if (!res?.ok) throw new Error(res?.error || "Could not highlight step.");
-        setStatus(`Highlighted step ${stepIndex + 1}.`);
+        const usedSelector = res.data?.highlight?.usedSelector ? `\nResolved with: ${res.data.highlight.usedSelector}` : "";
+        setStatus(`Highlighted step ${stepIndex + 1}.${usedSelector}`);
       } catch (err) {
         setStatus(err?.message || String(err));
       } finally {
@@ -170,6 +206,7 @@ async function loadReview() {
     const res = await sendMessage({ type: "GET_WORKFLOW_REVIEW", workflowId });
     if (!res?.ok) throw new Error(res?.error || "Failed to load workflow review.");
     renderReview(res.data);
+    await persistPopupUiState();
     setStatus(`Loaded Ghost Mode review for workflow ${workflowId}.`);
   } catch (err) {
     setStatus(err?.message || String(err));
@@ -190,13 +227,14 @@ async function saveReview(markReviewed = true, alsoRun = false) {
     const type = alsoRun ? "APPROVE_AND_RUN_WORKFLOW" : "SAVE_WORKFLOW_REVIEW";
     const res = await sendMessage({ type, workflowId, steps, markReviewed });
     if (!res?.ok) throw new Error(res?.error || "Failed to save workflow review.");
-    if (alsoRun) {
-      await loadReview();
-      setStatus(`Workflow ${workflowId} approved and loaded into player.`);
-    } else {
-      await loadReview();
-      setStatus(markReviewed ? `Workflow ${workflowId} approved.` : `Workflow ${workflowId} edits saved.`);
-    }
+    await loadReview();
+    setStatus(
+      alsoRun
+        ? `Workflow ${workflowId} approved and loaded into player.`
+        : markReviewed
+          ? `Workflow ${workflowId} approved.`
+          : `Workflow ${workflowId} edits saved.`
+    );
   } catch (err) {
     setStatus(err?.message || String(err));
   } finally {
@@ -210,8 +248,8 @@ async function refreshState() {
     if (recordingRes?.ok && els.recordingInfo) {
       const state = recordingRes.data;
       els.recordingInfo.textContent = state.recording
-        ? `Recording... ${state.stepCount} step(s)`
-        : `Not recording. Last workflow ID: ${state.lastWorkflowId ?? "none"}`;
+        ? `Recording is active. Captured ${state.stepCount} step(s).`
+        : `Recorder idle. Last workflow ID: ${state.lastWorkflowId ?? "none"}`;
       if (els.workflowIdInput && !els.workflowIdInput.value && state.lastWorkflowId) {
         els.workflowIdInput.value = String(state.lastWorkflowId);
       }
@@ -264,6 +302,11 @@ els.saveReview?.addEventListener("click", () => saveReview(false, false));
 els.approveRun?.addEventListener("click", () => saveReview(true, true));
 els.clearHighlight?.addEventListener("click", async () => {
   const res = await sendMessage({ type: "CLEAR_HIGHLIGHT" });
+  if (res?.ok) {
+    highlightedStepIndex = null;
+    applyHighlightedReviewState();
+    await persistPopupUiState();
+  }
   setStatus(res?.ok ? "Highlight cleared." : res?.error || "Failed to clear highlight.");
 });
 
@@ -314,5 +357,31 @@ els.stepDelayInput?.addEventListener("change", async () => {
   setStatus(res?.ok ? `Step delay set to ${safeDelay} ms.` : res?.error || "Failed to save delay.");
 });
 
-refreshState();
-setInterval(refreshState, 1000);
+async function restoreCachedReviewState() {
+  try {
+    const cache = await sendMessage({ type: "GET_CACHED_REVIEW_STATE" });
+    if (!cache?.ok) return;
+    const { lastReview, currentHighlight, lastWorkflowId } = cache.data || {};
+    const popupState = (await chrome.storage.local.get(["popupUiState"]))?.popupUiState || {};
+    const preferredWorkflowId = popupState.workflowId || currentHighlight?.workflowId || lastReview?.workflowId || lastWorkflowId;
+    if (els.workflowIdInput && preferredWorkflowId && !els.workflowIdInput.value) {
+      els.workflowIdInput.value = String(preferredWorkflowId);
+    }
+    highlightedStepIndex = Number.isInteger(popupState.highlightedStepIndex) ? popupState.highlightedStepIndex : (Number.isInteger(currentHighlight?.stepIndex) ? currentHighlight.stepIndex : null);
+    if (lastReview?.workflowId && String(lastReview.workflowId) === String(preferredWorkflowId)) {
+      renderReview(lastReview);
+      const msg = highlightedStepIndex !== null
+        ? `Restored Ghost Mode review for workflow ${lastReview.workflowId}. Highlighted step ${highlightedStepIndex + 1} is still active on the page.`
+        : `Restored Ghost Mode review for workflow ${lastReview.workflowId}.`;
+      setStatus(msg);
+    }
+  } catch (err) {
+    console.warn("Failed to restore cached review state", err);
+  }
+}
+
+(async () => {
+  await restoreCachedReviewState();
+  await refreshState();
+  setInterval(refreshState, 1000);
+})();
